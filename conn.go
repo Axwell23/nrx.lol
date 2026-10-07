@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -30,6 +31,7 @@ type SecureConn struct {
 	peerPubBytes []byte
 	mu           sync.Mutex // protects writes
 	rpcMu        sync.Mutex // protects request-response pairs
+	stateMu      sync.RWMutex
 }
 
 // Connect establishes an encrypted TCP connection to the server.
@@ -40,40 +42,45 @@ func Connect() (*SecureConn, error) {
 	}
 
 	sc := &SecureConn{conn: conn}
-
 	if err := sc.performHandshake(); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("handshake failed: %w", err)
 	}
-
 	return sc, nil
 }
 
 func (sc *SecureConn) performHandshake() error {
-	// Generate client ECDH key pair
 	privKey, err := generateECDHKeyPair()
 	if err != nil {
-		return err
+		return fmt.Errorf("generate ECDH key: %w", err)
 	}
 
-	// Send HANDSHAKE with our public key
 	pubBytes := privKey.PublicKey().Bytes()
-	hsPayload, _ := json.Marshal(HandshakePayload{PubKey: pubBytes})
-	hsMsg, _ := json.Marshal(Message{Type: MsgHandshake, Payload: hsPayload})
-	if err := sc.writeRaw(hsMsg); err != nil {
-		return err
+	hsPayload, err := json.Marshal(HandshakePayload{PubKey: pubBytes})
+	if err != nil {
+		return fmt.Errorf("marshal handshake payload: %w", err)
 	}
 
-	// Read HANDSHAKE_ACK
-	sc.conn.SetReadDeadline(time.Now().Add(dialTimeout))
+	hsMsg, err := json.Marshal(Message{Type: MsgHandshake, Payload: hsPayload})
+	if err != nil {
+		return fmt.Errorf("marshal handshake message: %w", err)
+	}
+
+	if err := sc.writeRaw(hsMsg); err != nil {
+		return fmt.Errorf("send handshake: %w", err)
+	}
+
+	if err := sc.conn.SetReadDeadline(time.Now().Add(dialTimeout)); err != nil {
+		return fmt.Errorf("set read deadline: %w", err)
+	}
 	ackData, err := sc.readRaw()
 	if err != nil {
-		return err
+		return fmt.Errorf("read handshake ack: %w", err)
 	}
 
 	var ackMsg Message
 	if err := json.Unmarshal(ackData, &ackMsg); err != nil {
-		return err
+		return fmt.Errorf("decode handshake ack: %w", err)
 	}
 	if ackMsg.Type != MsgHandshakeAck {
 		return fmt.Errorf("expected handshake ack, got %d", ackMsg.Type)
@@ -81,27 +88,32 @@ func (sc *SecureConn) performHandshake() error {
 
 	var ackPayload HandshakePayload
 	if err := json.Unmarshal(ackMsg.Payload, &ackPayload); err != nil {
-		return err
+		return fmt.Errorf("decode handshake ack payload: %w", err)
 	}
 
-	// Verify key material works by doing a test derivation
 	testKey, err := deriveAESKey(privKey, ackPayload.PubKey)
 	if err != nil {
-		return err
+		return fmt.Errorf("derive test key: %w", err)
 	}
-	for i := range testKey {
-		testKey[i] = 0
-	}
+	zeroKey(testKey)
 
-	// Store key material — AES key derived on demand, never stored
+	sc.stateMu.Lock()
 	sc.privKey = privKey
-	sc.peerPubBytes = ackPayload.PubKey
+	sc.peerPubBytes = append([]byte(nil), ackPayload.PubKey...)
+	sc.stateMu.Unlock()
+
 	return nil
 }
 
 // deriveKey derives the AES key on demand from stored ECDH material.
 // Caller MUST zero the returned key after use.
 func (sc *SecureConn) deriveKey() ([]byte, error) {
+	sc.stateMu.RLock()
+	defer sc.stateMu.RUnlock()
+
+	if sc.privKey == nil || len(sc.peerPubBytes) == 0 {
+		return nil, errors.New("secure connection not initialized")
+	}
 	return deriveAESKey(sc.privKey, sc.peerPubBytes)
 }
 
@@ -129,22 +141,46 @@ func (sc *SecureConn) readRaw() ([]byte, error) {
 }
 
 func (sc *SecureConn) writeRaw(data []byte) error {
+	if sc == nil || sc.conn == nil {
+		return errors.New("connection is nil")
+	}
+
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 
-	sc.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-	if err := binary.Write(sc.conn, binary.BigEndian, uint32(len(data))); err != nil {
+	if err := sc.conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
 		return err
 	}
-	_, err := sc.conn.Write(data)
-	return err
+
+	header := make([]byte, 4)
+	binary.BigEndian.PutUint32(header, uint32(len(data)))
+	if _, err := sc.conn.Write(header); err != nil {
+		return err
+	}
+
+	for len(data) > 0 {
+		n, err := sc.conn.Write(data)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+
+	return nil
 }
 
 // Send sends an encrypted message. AES key is derived, used, and zeroed.
 func (sc *SecureConn) Send(msg *Message) error {
+	if sc == nil || sc.conn == nil {
+		return errors.New("connection is nil")
+	}
+
 	data, err := json.Marshal(msg)
 	if err != nil {
-		return err
+		return fmt.Errorf("marshal message: %w", err)
 	}
 	key, err := sc.deriveKey()
 	if err != nil {
@@ -160,7 +196,13 @@ func (sc *SecureConn) Send(msg *Message) error {
 
 // Receive reads and decrypts a message. AES key is derived, used, and zeroed.
 func (sc *SecureConn) Receive() (*Message, error) {
-	sc.conn.SetReadDeadline(time.Now().Add(readTimeout))
+	if sc == nil || sc.conn == nil {
+		return nil, errors.New("connection is nil")
+	}
+
+	if err := sc.conn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
+		return nil, err
+	}
 	raw, err := sc.readRaw()
 	if err != nil {
 		return nil, err
@@ -208,11 +250,15 @@ func (sc *SecureConn) Login(username, password string) (*LoginOKPayload, error) 
 	switch resp.Type {
 	case MsgLoginOK:
 		var p LoginOKPayload
-		json.Unmarshal(resp.Payload, &p)
+		if err := json.Unmarshal(resp.Payload, &p); err != nil {
+			return nil, fmt.Errorf("decode login payload: %w", err)
+		}
 		return &p, nil
 	case MsgLoginErr:
 		var p LoginErrPayload
-		json.Unmarshal(resp.Payload, &p)
+		if err := json.Unmarshal(resp.Payload, &p); err != nil {
+			return nil, fmt.Errorf("decode login error payload: %w", err)
+		}
 		return nil, fmt.Errorf("%s", p.Reason)
 	default:
 		return nil, fmt.Errorf("unexpected response: %d", resp.Type)
@@ -235,12 +281,16 @@ func (sc *SecureConn) QueueSubmit(yamlData string) (string, error) {
 
 	if resp.Type == MsgQueueSubmitOK {
 		var p QueueSubmitOKPayload
-		json.Unmarshal(resp.Payload, &p)
+		if err := json.Unmarshal(resp.Payload, &p); err != nil {
+			return "", fmt.Errorf("decode queue submit ok payload: %w", err)
+		}
 		return p.QueueID, nil
 	}
 
 	var e ErrorPayload
-	json.Unmarshal(resp.Payload, &e)
+	if err := json.Unmarshal(resp.Payload, &e); err != nil {
+		return "", fmt.Errorf("decode queue submit error payload: %w", err)
+	}
 	return "", fmt.Errorf("%s", e.Reason)
 }
 
@@ -260,7 +310,9 @@ func (sc *SecureConn) QueuePoll(queueID string) (string, error) {
 
 	if resp.Type == MsgQueueStatus {
 		var p QueueStatusPayload
-		json.Unmarshal(resp.Payload, &p)
+		if err := json.Unmarshal(resp.Payload, &p); err != nil {
+			return "", fmt.Errorf("decode queue status payload: %w", err)
+		}
 		return p.Status, nil
 	}
 	return "", fmt.Errorf("unexpected response: %d", resp.Type)
@@ -283,7 +335,9 @@ func (sc *SecureConn) QueueFetchNext() (*QueueItemPayload, error) {
 	switch resp.Type {
 	case MsgQueueItem:
 		var p QueueItemPayload
-		json.Unmarshal(resp.Payload, &p)
+		if err := json.Unmarshal(resp.Payload, &p); err != nil {
+			return nil, fmt.Errorf("decode queue item payload: %w", err)
+		}
 		return &p, nil
 	case MsgQueueEmpty:
 		return nil, nil
@@ -311,7 +365,9 @@ func (sc *SecureConn) QueueMarkDone(queueID string) error {
 	}
 
 	var e ErrorPayload
-	json.Unmarshal(resp.Payload, &e)
+	if err := json.Unmarshal(resp.Payload, &e); err != nil {
+		return fmt.Errorf("decode queue mark done error payload: %w", err)
+	}
 	return fmt.Errorf("%s", e.Reason)
 }
 
@@ -351,7 +407,9 @@ func (sc *SecureConn) SyncPoll() (string, error) {
 
 	if resp.Type == MsgSyncStatus {
 		var p SyncStatusPayload
-		json.Unmarshal(resp.Payload, &p)
+		if err := json.Unmarshal(resp.Payload, &p); err != nil {
+			return "", fmt.Errorf("decode sync status payload: %w", err)
+		}
 		return p.Signal, nil
 	}
 	return "", fmt.Errorf("unexpected response: %d", resp.Type)
@@ -373,12 +431,16 @@ func (sc *SecureConn) LicenseCheck() (*LicenseStatusPayload, error) {
 
 	if resp.Type == MsgLicenseStatus {
 		var p LicenseStatusPayload
-		json.Unmarshal(resp.Payload, &p)
+		if err := json.Unmarshal(resp.Payload, &p); err != nil {
+			return nil, fmt.Errorf("decode license status payload: %w", err)
+		}
 		return &p, nil
 	}
 
 	var e ErrorPayload
-	json.Unmarshal(resp.Payload, &e)
+	if err := json.Unmarshal(resp.Payload, &e); err != nil {
+		return nil, fmt.Errorf("decode license check error payload: %w", err)
+	}
 	return nil, fmt.Errorf("%s", e.Reason)
 }
 
@@ -415,7 +477,7 @@ func (sc *SecureConn) Heartbeat() error {
 		return fmt.Errorf("heartbeat: derive key: %w", err)
 	}
 	mac := hmac.New(sha256.New, key)
-	mac.Write(challenge)
+	_, _ = mac.Write(challenge)
 	expected := mac.Sum(nil)
 	zeroKey(key)
 
@@ -434,13 +496,22 @@ func (sc *SecureConn) UploadLogs(lines []string) {
 	if err := sc.sendPayload(MsgLogUpload, LogUploadPayload{Lines: lines}); err != nil {
 		return
 	}
-	sc.Receive() // consume ack, ignore errors
+	_, _ = sc.Receive()
 }
 
 // Close sends disconnect and clears key material.
 func (sc *SecureConn) Close() {
-	sc.Send(&Message{Type: MsgDisconnect})
+	if sc == nil || sc.conn == nil {
+		return
+	}
+
+	_ = sc.Send(&Message{Type: MsgDisconnect})
+
+	sc.stateMu.Lock()
 	sc.privKey = nil
 	sc.peerPubBytes = nil
-	sc.conn.Close()
+	sc.stateMu.Unlock()
+
+	_ = sc.conn.Close()
 }
+

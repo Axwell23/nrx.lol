@@ -17,6 +17,7 @@ type LeagueProxy struct {
 	ca       *CertAuthority
 	quit     chan struct{}
 	wg       sync.WaitGroup
+	stopOnce sync.Once
 }
 
 func NewLeagueProxy() (*LeagueProxy, error) {
@@ -36,7 +37,7 @@ func getFreePort() (int, error) {
 		return 0, err
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
-	ln.Close()
+	_ = ln.Close()
 	return port, nil
 }
 
@@ -74,9 +75,22 @@ func (p *LeagueProxy) Start() (int, error) {
 }
 
 func (p *LeagueProxy) Stop() {
-	close(p.quit)
-	p.listener.Close()
-	p.wg.Wait()
+	if p == nil {
+		return
+	}
+	p.stopOnce.Do(func() {
+		if p.quit != nil {
+			select {
+			case <-p.quit:
+			default:
+				close(p.quit)
+			}
+		}
+		if p.listener != nil {
+			_ = p.listener.Close()
+		}
+		p.wg.Wait()
+	})
 }
 
 func (p *LeagueProxy) handleConnection(clientConn net.Conn) {
@@ -88,11 +102,12 @@ func (p *LeagueProxy) handleConnection(clientConn net.Conn) {
 		return
 	}
 
-	if req.Method == "CONNECT" {
+	if req.Method == http.MethodConnect {
 		p.handleConnect(clientConn, req)
-	} else {
-		p.handleHTTP(clientConn, req)
+		return
 	}
+
+	p.handleHTTP(clientConn, req)
 }
 
 func (p *LeagueProxy) handleConnect(clientConn net.Conn, req *http.Request) {
@@ -105,36 +120,37 @@ func (p *LeagueProxy) handleConnect(clientConn net.Conn, req *http.Request) {
 
 	if hostname == decodeStr(targetDomainObf) {
 		p.handleMITM(clientConn, host)
-	} else {
-		p.handleTunnel(clientConn, host)
+		return
 	}
+
+	p.handleTunnel(clientConn, host)
 }
 
 func (p *LeagueProxy) handleTunnel(clientConn net.Conn, targetHost string) {
 	targetConn, err := net.Dial("tcp", targetHost)
 	if err != nil {
-		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		_, _ = clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
 	defer targetConn.Close()
 
-	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	_, _ = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		io.Copy(targetConn, clientConn)
+		_, _ = io.Copy(targetConn, clientConn)
 	}()
 	go func() {
 		defer wg.Done()
-		io.Copy(clientConn, targetConn)
+		_, _ = io.Copy(clientConn, targetConn)
 	}()
 	wg.Wait()
 }
 
 func (p *LeagueProxy) handleMITM(clientConn net.Conn, targetHost string) {
-	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	_, _ = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
 	hostname := strings.Split(targetHost, ":")[0]
 
@@ -169,27 +185,25 @@ func (p *LeagueProxy) handleMITM(clientConn net.Conn, targetHost string) {
 		innerReq.Header.Del("Accept-Encoding")
 
 		if err := innerReq.Write(realConn); err != nil {
-			realConn.Close()
+			_ = realConn.Close()
 			return
 		}
 
 		realReader := bufio.NewReader(realConn)
 		resp, err := http.ReadResponse(realReader, innerReq)
 		if err != nil {
-			realConn.Close()
+			_ = realConn.Close()
 			return
 		}
 
 		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		realConn.Close()
-
+		_ = resp.Body.Close()
+		_ = realConn.Close()
 		if err != nil {
 			return
 		}
 
 		modifiedBody, wasModified := ModifyPayload(body, resp.Header)
-
 		if wasModified {
 			resp.Header.Del("Content-Encoding")
 			resp.Header.Del("Transfer-Encoding")
@@ -198,7 +212,7 @@ func (p *LeagueProxy) handleMITM(clientConn net.Conn, targetHost string) {
 		}
 
 		resp.Body = io.NopCloser(strings.NewReader(string(modifiedBody)))
-		resp.Write(tlsClientConn)
+		_ = resp.Write(tlsClientConn)
 	}
 }
 
@@ -213,15 +227,16 @@ func (p *LeagueProxy) handleHTTP(clientConn net.Conn, req *http.Request) {
 
 	if isConfigRequest {
 		p.handleConfigRequest(clientConn, req)
-	} else {
-		p.handleHTTPPassthrough(clientConn, req)
+		return
 	}
+
+	p.handleHTTPPassthrough(clientConn, req)
 }
 
 func (p *LeagueProxy) handleConfigRequest(clientConn net.Conn, req *http.Request) {
 	realConn, err := tls.Dial("tcp", decodeStr(targetDomainObf)+":443", &tls.Config{ServerName: decodeStr(targetDomainObf)})
 	if err != nil {
-		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
+		_, _ = clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
 		return
 	}
 	defer realConn.Close()
@@ -243,13 +258,12 @@ func (p *LeagueProxy) handleConfigRequest(clientConn net.Conn, req *http.Request
 	}
 
 	body, err := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if err != nil {
 		return
 	}
 
 	modifiedBody, wasModified := ModifyPayload(body, resp.Header)
-
 	if wasModified {
 		resp.Header.Del("Content-Encoding")
 		resp.Header.Del("Transfer-Encoding")
@@ -258,7 +272,7 @@ func (p *LeagueProxy) handleConfigRequest(clientConn net.Conn, req *http.Request
 	}
 
 	resp.Body = io.NopCloser(strings.NewReader(string(modifiedBody)))
-	resp.Write(clientConn)
+	_ = resp.Write(clientConn)
 }
 
 func (p *LeagueProxy) handleHTTPPassthrough(clientConn net.Conn, req *http.Request) {
@@ -269,11 +283,12 @@ func (p *LeagueProxy) handleHTTPPassthrough(clientConn net.Conn, req *http.Reque
 
 	targetConn, err := net.Dial("tcp", host)
 	if err != nil {
-		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
+		_, _ = clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
 		return
 	}
 	defer targetConn.Close()
 
-	req.Write(targetConn)
-	io.Copy(clientConn, targetConn)
+	_ = req.Write(targetConn)
+	_, _ = io.Copy(clientConn, targetConn)
 }
+

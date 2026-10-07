@@ -21,6 +21,10 @@ type App struct {
 	licenseCheckCh chan struct{}
 	debugLog       []string
 	debugMu        sync.Mutex
+
+	stopOnce    sync.Once
+	licenseOnce sync.Once
+	cleanupOnce sync.Once
 }
 
 // NewApp creates a new App instance.
@@ -86,12 +90,11 @@ func (a *App) Login(username, password string) string {
 
 	license, err := conn.Login(username, password)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		a.mu.Lock()
 		a.status = "disconnected"
 		a.mu.Unlock()
 		msg := err.Error()
-		// Only show known safe server messages, hide everything else
 		switch msg {
 		case "invalid credentials", "too many devices", "no active license":
 			return msg
@@ -128,7 +131,7 @@ func (a *App) PrepareLogin(rcsPath string) string {
 		a.mu.Unlock()
 		return "must be logged in first"
 	}
-	if !a.license.HasLicense {
+	if a.license == nil || !a.license.HasLicense {
 		a.mu.Unlock()
 		return "no active license"
 	}
@@ -137,7 +140,6 @@ func (a *App) PrepareLogin(rcsPath string) string {
 
 	a.logDebug("[main-pc] PrepareLogin started, rcsPath=%q, platform=%s", rcsPath, runtime.GOOS)
 
-	// Verify server before modifying system
 	if errMsg := a.heartbeatOrFail(); errMsg != "" {
 		a.logDebug("heartbeat failed: %s", errMsg)
 		a.flushLogs()
@@ -145,17 +147,14 @@ func (a *App) PrepareLogin(rcsPath string) string {
 	}
 	a.logDebug("heartbeat ok")
 
-	// Kill existing Riot processes
 	terminateRiotServices()
 	a.logDebug("terminated riot services")
 
-	// Stop Vanguard if running
 	if IsVanguardRunning() {
 		StopVanguard()
 		a.logDebug("stopped vanguard")
 	}
 
-	// Start proxy
 	proxy, err := NewLeagueProxy()
 	if err != nil {
 		a.logDebug("proxy create failed: %v", err)
@@ -178,14 +177,13 @@ func (a *App) PrepareLogin(rcsPath string) string {
 	a.proxy = proxy
 	a.logDebug("proxy started on port %d", port)
 
-	// Find RCS
 	rcs := rcsPath
 	if rcs == "" {
 		rcs = FindRiotClientServices()
 		if rcs == "" {
 			a.logDebug("RCS not found")
 			a.flushLogs()
-			proxy.Stop()
+			_ = proxy.Stop()
 			a.mu.Lock()
 			a.status = "logged_in"
 			a.mu.Unlock()
@@ -194,11 +192,10 @@ func (a *App) PrepareLogin(rcsPath string) string {
 	}
 	a.logDebug("RCS found: %s", rcs)
 
-	// Launch Riot Client — user logs in manually
 	if err := LaunchRCSLogin(rcs, port, decodeStr(patchlineLiveObf)); err != nil {
 		a.logDebug("RCS launch failed: %v", err)
 		a.flushLogs()
-		proxy.Stop()
+		_ = proxy.Stop()
 		a.mu.Lock()
 		a.status = "logged_in"
 		a.mu.Unlock()
@@ -227,15 +224,8 @@ func (a *App) Stop() string {
 		return "nothing to stop"
 	}
 
-	if a.stopCh != nil {
-		select {
-		case <-a.stopCh:
-		default:
-			close(a.stopCh)
-		}
-	}
+	a.closeStopCh()
 
-	// Don't kill Riot/League processes on stop — user may want to keep playing
 	if a.proxy != nil {
 		a.proxy.Stop()
 		a.proxy = nil
@@ -257,7 +247,7 @@ func (a *App) StartWorker() string {
 		a.mu.Unlock()
 		return "must be logged in first"
 	}
-	if !a.license.HasLicense {
+	if a.license == nil || !a.license.HasLicense {
 		a.mu.Unlock()
 		return "no active license"
 	}
@@ -265,7 +255,6 @@ func (a *App) StartWorker() string {
 	a.stopCh = make(chan struct{})
 	a.mu.Unlock()
 
-	// Verify server before starting
 	if errMsg := a.heartbeatOrFail(); errMsg != "" {
 		return errMsg
 	}
@@ -281,7 +270,6 @@ func (a *App) StartWorker() string {
 func (a *App) workerLoop() {
 	a.logDebug("[2nd-pc] workerLoop started")
 
-	// Initial launch if League client is not already running
 	if !isLeagueClientRunning() {
 		a.logDebug("[2nd-pc] League client not running, launching")
 		launchLeague()
@@ -298,13 +286,11 @@ func (a *App) workerLoop() {
 		default:
 		}
 
-		// Kill the game process if it tries to start
 		if isLeagueGameRunning() {
 			a.logDebug("[2nd-pc] League game detected, terminating")
 			killLeagueGame()
 		}
 
-		// Keep League client alive — restart if it crashed
 		if !isLeagueClientRunning() {
 			a.logDebug("[2nd-pc] League client not running, restarting")
 			if err := launchLeague(); err != nil {
@@ -336,13 +322,31 @@ func (a *App) StopWorker() string {
 	}
 	a.mu.Unlock()
 
-	close(a.stopCh)
+	a.closeStopCh()
 
 	a.mu.Lock()
 	a.status = "logged_in"
 	a.mu.Unlock()
 
 	return "ok"
+}
+
+func (a *App) closeStopCh() {
+	if a.stopCh == nil {
+		return
+	}
+	a.stopOnce.Do(func() {
+		close(a.stopCh)
+	})
+}
+
+func (a *App) closeLicenseCheckCh() {
+	if a.licenseCheckCh == nil {
+		return
+	}
+	a.licenseOnce.Do(func() {
+		close(a.licenseCheckCh)
+	})
 }
 
 // --- internal helpers ---
@@ -354,7 +358,7 @@ func (a *App) heartbeatOrFail() string {
 	}
 	if err := a.conn.Heartbeat(); err != nil {
 		if a.conn != nil {
-			a.conn.Close()
+			_ = a.conn.Close()
 			a.conn = nil
 		}
 		a.mu.Lock()
@@ -386,46 +390,40 @@ func (a *App) licenseCheckLoop() {
 			}
 
 			status, err := conn.LicenseCheck()
-			if err != nil || !status.Valid {
+			if err != nil || status == nil || !status.Valid {
 				a.cleanup()
-				os.Exit(0)
+				return
 			}
 		}
 	}
 }
 
 func (a *App) cleanup() {
-	if a.licenseCheckCh != nil {
-		select {
-		case <-a.licenseCheckCh:
-		default:
-			close(a.licenseCheckCh)
+	a.cleanupOnce.Do(func() {
+		if a.licenseCheckCh != nil {
+			a.closeLicenseCheckCh()
+			a.licenseCheckCh = nil
 		}
-		a.licenseCheckCh = nil
-	}
 
-	if a.stopCh != nil {
-		select {
-		case <-a.stopCh:
-		default:
-			close(a.stopCh)
+		if a.stopCh != nil {
+			a.closeStopCh()
 		}
-	}
 
-	if a.proxy != nil {
-		a.proxy.Stop()
-		a.proxy = nil
-	}
+		if a.proxy != nil {
+			a.proxy.Stop()
+			a.proxy = nil
+		}
 
-	if a.conn != nil {
-		a.conn.Close()
-		a.conn = nil
-	}
+		if a.conn != nil {
+			_ = a.conn.Close()
+			a.conn = nil
+		}
 
-	a.mu.Lock()
-	a.license = nil
-	a.status = "disconnected"
-	a.mu.Unlock()
+		a.mu.Lock()
+		a.license = nil
+		a.status = "disconnected"
+		a.mu.Unlock()
+	})
 }
 
 // logCleanLoop removes Riot log directories every 5 seconds while the main PC is running.
@@ -474,7 +472,7 @@ func (a *App) flushLogs() {
 		return
 	}
 	if a.conn != nil {
-		a.conn.UploadLogs(lines)
+		_ = a.conn.UploadLogs(lines)
 	}
 }
 
@@ -483,3 +481,4 @@ func (a *App) flushLogs() {
 // isLeagueGameRunning is defined per-platform in process_*.go
 // killLeagueGame is defined per-platform in process_*.go
 // StopVanguard, IsVanguardRunning are in vanguard_*.go
+
