@@ -21,29 +21,16 @@ func FindRiotClientServices() string {
 	}
 
 	for _, p := range searchPaths {
-		if _, err := os.Stat(p); err == nil {
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
 			return p
 		}
 	}
 
 	programData := os.Getenv("ProgramData")
 	if programData != "" {
-		if data, err := os.ReadFile(filepath.Join(programData, "Riot Games", decodeStr(rcsInstallsJsonObf))); err == nil {
-			content := string(data)
-			if idx := strings.Index(content, `"`+decodeStr(rcLiveKeyObf)+`"`); idx != -1 {
-				rest := content[idx+len(`"`+decodeStr(rcLiveKeyObf)+`"`):]
-				if colonIdx := strings.Index(rest, `"`); colonIdx != -1 {
-					rest = rest[colonIdx+1:]
-					if endIdx := strings.Index(rest, `"`); endIdx != -1 {
-						path := rest[:endIdx]
-						path = strings.ReplaceAll(path, `\\`, `\`)
-						path = strings.ReplaceAll(path, `/`, `\`)
-						if _, err := os.Stat(path); err == nil {
-							return path
-						}
-					}
-				}
-			}
+		p := filepath.Join(programData, "Riot Games", "Riot Client", decodeStr(rcsExeObf))
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			return p
 		}
 	}
 
@@ -51,6 +38,13 @@ func FindRiotClientServices() string {
 }
 
 func LaunchRCSLogin(rcsPath string, proxyPort int, patchline string) error {
+	if rcsPath == "" {
+		return fmt.Errorf("empty RCS path")
+	}
+	if info, err := os.Stat(rcsPath); err != nil || info.IsDir() {
+		return fmt.Errorf("invalid RCS path: %w", err)
+	}
+
 	clientConfigURL := fmt.Sprintf("http://127.0.0.1:%d", proxyPort)
 	args := []string{
 		"--launch-patchline=" + patchline,
@@ -61,6 +55,13 @@ func LaunchRCSLogin(rcsPath string, proxyPort int, patchline string) error {
 }
 
 func LaunchRCSGame(rcsPath string, proxyPort int, product, patchline string) error {
+	if rcsPath == "" {
+		return fmt.Errorf("empty RCS path")
+	}
+	if info, err := os.Stat(rcsPath); err != nil || info.IsDir() {
+		return fmt.Errorf("invalid RCS path: %w", err)
+	}
+
 	clientConfigURL := fmt.Sprintf("http://127.0.0.1:%d", proxyPort)
 	args := []string{
 		"--launch-patchline=" + patchline,
@@ -77,24 +78,26 @@ func launchRCSWithArgs(rcsPath string, proxyPort int, args []string) error {
 	proxyAddr := fmt.Sprintf("http://127.0.0.1:%d", proxyPort)
 	env := os.Environ()
 
-	filteredEnv := make([]string, 0, len(env))
+	fileredEnv := make([]string, 0, len(env)+3)
 	for _, e := range env {
 		upper := strings.ToUpper(e)
 		if strings.HasPrefix(upper, "HTTP_PROXY=") ||
 			strings.HasPrefix(upper, "HTTPS_PROXY=") ||
-			strings.HasPrefix(upper, "NO_PROXY=") {
+			strings.HasPrefix(upper, "NO_PROXY=") ||
+			strings.HasPrefix(upper, "ALL_PROXY=") ||
+			strings.HasPrefix(upper, "FTP_PROXY=") {
 			continue
 		}
-		filteredEnv = append(filteredEnv, e)
+		fileredEnv = append(fileredEnv, e)
 	}
 
-	filteredEnv = append(filteredEnv,
+	fileredEnv = append(fileredEnv,
 		"HTTP_PROXY="+proxyAddr,
 		"HTTPS_PROXY="+proxyAddr,
 	)
 
 	hasSystemRoot := false
-	for _, e := range filteredEnv {
+	for _, e := range fileredEnv {
 		if strings.HasPrefix(strings.ToUpper(e), "SYSTEMROOT=") {
 			hasSystemRoot = true
 			break
@@ -105,10 +108,10 @@ func launchRCSWithArgs(rcsPath string, proxyPort int, args []string) error {
 		if systemRoot == "" {
 			systemRoot = `C:\Windows`
 		}
-		filteredEnv = append(filteredEnv, "SYSTEMROOT="+systemRoot)
+		fileredEnv = append(fileredEnv, "SYSTEMROOT="+systemRoot)
 	}
 
-	cmd.Env = filteredEnv
+	cmd.Env = fileredEnv
 	return cmd.Start()
 }
 
@@ -117,7 +120,7 @@ func clearSavedLogin() {
 	if localAppData == "" {
 		return
 	}
-	os.Remove(filepath.Join(localAppData, "Riot Games", "Riot Client", "Data", decodeStr(riotSettingsFileObf)))
+	_ = os.Remove(filepath.Join(localAppData, "Riot Games", "Riot Client", "Data", decodeStr(riotSettingsFileObf)))
 }
 
 func getSettingsPath() string {
@@ -155,17 +158,17 @@ func launchLeague() error {
 func clearRiotLogs() {
 	localAppData := os.Getenv("LOCALAPPDATA")
 	if localAppData != "" {
-		os.RemoveAll(filepath.Join(localAppData, "Riot Games", "Riot Client", "Logs"))
-		os.RemoveAll(filepath.Join(localAppData, "Riot Games", "Riot Client", "Crashes"))
-		os.RemoveAll(filepath.Join(localAppData, "Riot Games", "League of Legends", "Logs"))
+		_ = os.RemoveAll(filepath.Join(localAppData, "Riot Games", "Riot Client", "Logs"))
+		_ = os.RemoveAll(filepath.Join(localAppData, "Riot Games", "Riot Client", "Crashes"))
+		_ = os.RemoveAll(filepath.Join(localAppData, "Riot Games", "League of Legends", "Logs"))
 	}
 	for _, drive := range []string{"C", "D", "E", "F"} {
 		root := drive + `:\`
 		if _, err := os.Stat(root); err != nil {
 			continue
 		}
-		os.RemoveAll(filepath.Join(root, "Riot Games", "Riot Client", "Logs"))
-		os.RemoveAll(filepath.Join(root, "Riot Games", "League of Legends", "Logs"))
-		os.RemoveAll(filepath.Join(root, "Riot Games", "League of Legends", "Game", "Logs"))
+		_ = os.RemoveAll(filepath.Join(root, "Riot Games", "Riot Client", "Logs"))
+		_ = os.RemoveAll(filepath.Join(root, "Riot Games", "League of Legends", "Logs"))
+		_ = os.RemoveAll(filepath.Join(root, "Riot Games", "League of Legends", "Game", "Logs"))
 	}
 }

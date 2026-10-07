@@ -8,23 +8,28 @@ import (
 )
 
 func isServiceRunning(name string) bool {
+	if name == "" {
+		return false
+	}
+
 	cmd := hideCmd(exec.Command("sc", "query", name))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return false
 	}
-	return strings.Contains(string(out), "RUNNING")
+
+	return strings.Contains(strings.ToUpper(string(out)), "RUNNING")
 }
 
 // StopVanguard stops all Vanguard services and disables them.
 func StopVanguard() {
 	// Stop vgc (Vanguard user-mode service)
-	hideCmd(exec.Command("sc", "stop", decodeStr(vgcServiceObf))).CombinedOutput()
-	hideCmd(exec.Command("sc", "config", decodeStr(vgcServiceObf), "start=", "disabled")).CombinedOutput()
+	_ = hideCmd(exec.Command("sc", "stop", decodeStr(vgcServiceObf))).Run()
+	_ = hideCmd(exec.Command("sc", "config", decodeStr(vgcServiceObf), "start=", "disabled")).Run()
 
 	// Stop vgk (Vanguard kernel driver)
-	hideCmd(exec.Command("sc", "stop", decodeStr(vgkServiceObf))).CombinedOutput()
-	hideCmd(exec.Command("sc", "config", decodeStr(vgkServiceObf), "start=", "disabled")).CombinedOutput()
+	_ = hideCmd(exec.Command("sc", "stop", decodeStr(vgkServiceObf))).Run()
+	_ = hideCmd(exec.Command("sc", "config", decodeStr(vgkServiceObf), "start=", "disabled")).Run()
 }
 
 // IsVanguardRunning checks if any Vanguard service is active.

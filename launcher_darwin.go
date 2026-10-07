@@ -9,19 +9,18 @@ import (
 )
 
 func FindRiotClientServices() string {
-	if _, err := os.Stat(decodeStr(macRCSPathObf)); err == nil {
-		return decodeStr(macRCSPathObf)
+	p := decodeStr(macRCSPathObf)
+	if info, err := os.Stat(p); err == nil && !info.IsDir() {
+		return p
 	}
 	return ""
 }
 
 func LaunchRCSLogin(_ string, _ int, _ string) error {
-	// macOS worker doesn't do login phase
 	return nil
 }
 
 func LaunchRCSGame(_ string, _ int, _, _ string) error {
-	// macOS worker uses launchLeague directly
 	return nil
 }
 
@@ -38,7 +37,11 @@ func saveYamlSettings(yamlData string) error {
 }
 
 func launchLeague() error {
-	cmd := exec.Command(decodeStr(macRCSPathObf),
+	p := decodeStr(macRCSPathObf)
+	if info, err := os.Stat(p); err != nil || info.IsDir() {
+		return err
+	}
+	cmd := exec.Command(p,
 		"--launch-patchline="+decodeStr(patchlineLiveObf),
 		"--launch-product="+decodeStr(productLoLObf),
 	)
@@ -51,7 +54,7 @@ func clearSavedLogin() {
 		return
 	}
 	p := filepath.Join(homeDir, "Library", "Application Support", "Riot Games", "Riot Client", "Data", decodeStr(riotSettingsFileObf))
-	os.Remove(p)
+	_ = os.Remove(p)
 }
 
 func getSettingsPath() string {

@@ -13,6 +13,8 @@ import (
 )
 
 // Run: go run obfuscate.go && gofmt -s -w obfuscate_gen.go
+// This tool generates obfuscate_gen.go with a random XOR/rotation cipher
+// to hide sensitive strings at compile time.
 
 func main() {
 	strings := []struct {
@@ -103,7 +105,11 @@ func main() {
 
 	// Write decode function
 	w.WriteString("func decodeStr(obf []byte) string {\n")
-	w.WriteString("\tret := make([]byte, len(obf))\n\tres := ret\n")
+	w.WriteString("\tif len(obf) == 0 {\n")
+	w.WriteString("\t\treturn \"\"\n")
+	w.WriteString("\t}\n")
+	w.WriteString("\tret := make([]byte, len(obf))\n")
+	w.WriteString("\tres := ret\n")
 	fmt.Fprintf(w, "\tseed := byte(%d)\n", scrambler[0])
 	w.WriteString("\tfor len(obf) > 0 {\n")
 
@@ -116,7 +122,7 @@ func main() {
 			fmt.Fprintf(w, "\t\tseed += %d\n", add[i])
 		}
 		fmt.Fprintf(w, "\t\tif len(obf) >= %d {\n", i+1)
-		fmt.Fprintf(w, "\t\t\tres[%d] = bits.RotateLeft8(obf[%d], %d) ^ %d ^ seed\n", i, i, -(-5 + j%10), xor[i])
+		fmt.Fprintf(w, "\t\t\tres[%d] = bits.RotateLeft8(obf[%d], %d) ^ %d ^ seed\n", i, i, -(-5+j%10), xor[i])
 		fmt.Fprintf(w, "\t\t\tseed ^= obf[%d]\n\t\t}\n", i)
 	}
 	w.WriteString("\t\tobf = obf[min(len(obf), 16):]\n")
@@ -155,7 +161,7 @@ func obfuscateKey(plain []byte, seed byte, xor []byte, add []byte, order [16]int
 		}
 
 		b := plain[i]
-		result[i] = bits.RotateLeft8((b ^ xor[i%16] ^ seed), -5+(j%16)%10)
+		result[i] = bits.RotateLeft8((b^xor[i%16]^seed), -5+(j%16)%10)
 		seed ^= result[i]
 
 		// Verify round-trip
